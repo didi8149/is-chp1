@@ -4,210 +4,187 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import assert from 'node:assert';
-import {describe, it, afterEach} from 'node:test';
+import {spawn} from 'node:child_process';
+import fs from 'node:fs';
+import net from 'node:net';
 
-import sinon from 'sinon';
+import {logger} from '../logger.js';
+import type {CallToolResult} from '../third_party/index.js';
+import {PipeTransport} from '../third_party/index.js';
+import {getTempFilePath} from '../utils/files.js';
 
-import type {ParsedArguments} from '../../src/bin/chrome-devtools-mcp-cli-options.js';
-import {startScreencast, stopScreencast} from '../../src/tools/screencast.js';
-import {withMcpContext} from '../utils.js';
+import type {DaemonMessage, DaemonResponse} from './types.js';
+import {
+  DAEMON_SCRIPT_PATH,
+  getSocketPath,
+  getPidFilePath,
+  isDaemonRunning,
+} from './utils.js';
 
-function createMockRecorder() {
-  return {
-    stop: sinon.stub().resolves(),
-  };
+const FILE_TIMEOUT = 10_000;
+
+/**
+ * Waits for a file to be created and populated (removed = false) or removed (removed = true).
+ */
+function waitForFile(filePath: string, removed = false) {
+  return new Promise<void>((resolve, reject) => {
+    const check = () => {
+      const exists = fs.existsSync(filePath);
+      if (removed) {
+        return !exists;
+      }
+      if (!exists) {
+        return false;
+      }
+      try {
+        return fs.statSync(filePath).size > 0;
+      } catch {
+        return false;
+      }
+    };
+
+    if (check()) {
+      resolve();
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      fs.unwatchFile(filePath);
+      reject(
+        new Error(
+          `Timeout: file ${filePath} ${removed ? 'not removed' : 'not found'} within ${FILE_TIMEOUT}ms`,
+        ),
+      );
+    }, FILE_TIMEOUT);
+
+    fs.watchFile(filePath, {interval: 500}, () => {
+      if (check()) {
+        clearTimeout(timer);
+        fs.unwatchFile(filePath);
+        resolve();
+      }
+    });
+  });
 }
 
-describe('screencast', () => {
-  afterEach(() => {
-    sinon.restore();
+export async function startDaemon(mcpArgs: string[] = [], sessionId: string) {
+  if (isDaemonRunning(sessionId)) {
+    logger('Daemon is already running');
+    return;
+  }
+
+  const pidFilePath = getPidFilePath(sessionId);
+
+  if (fs.existsSync(pidFilePath)) {
+    fs.unlinkSync(pidFilePath);
+  }
+
+  logger('Starting daemon...', ...mcpArgs);
+  const child = spawn(process.execPath, [DAEMON_SCRIPT_PATH, ...mcpArgs], {
+    detached: true,
+    stdio: 'ignore',
+    env: {...process.env, CHROME_DEVTOOLS_MCP_SESSION_ID: sessionId},
+    cwd: process.cwd(),
+    windowsHide: true,
+  });
+  child.unref();
+
+  await waitForFile(pidFilePath);
+}
+
+const SEND_COMMAND_TIMEOUT = 60_000; // ms
+
+/**
+ * `sendCommand` opens a socket connection sends a single command and disconnects.
+ */
+export async function sendCommand(
+  command: DaemonMessage,
+  sessionId: string,
+): Promise<DaemonResponse> {
+  const socketPath = getSocketPath(sessionId);
+
+  const socket = net.createConnection({
+    path: socketPath,
   });
 
-  describe('screencast_start', () => {
-    it('starts a screencast recording with filePath', async () => {
-      await withMcpContext(async (response, context) => {
-        const mockRecorder = createMockRecorder();
-        const selectedPage = context.getSelectedPptrPage();
-        const screencastStub = sinon
-          .stub(selectedPage, 'screencast')
-          .resolves(mockRecorder as never);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('Timeout waiting for daemon response'));
+    }, SEND_COMMAND_TIMEOUT);
 
-        await startScreencast().handler(
-          {
-            params: {filePath: '/tmp/test-recording.mp4'},
-            page: context.getSelectedMcpPage(),
-          },
-          response,
-          context,
-        );
-
-        sinon.assert.calledOnce(screencastStub);
-        const callArgs = screencastStub.firstCall.args[0];
-        assert.ok(callArgs);
-        assert.ok(callArgs.path?.endsWith('test-recording.mp4'));
-
-        assert.ok(context.getScreenRecorder() !== null);
-        assert.ok(
-          response.responseLines
-            .join('\n')
-            .includes('Screencast recording started'),
-        );
-      });
+    const transport = new PipeTransport(socket, socket);
+    transport.onmessage = async (message: string) => {
+      clearTimeout(timer);
+      logger('onmessage', message);
+      resolve(JSON.parse(message));
+    };
+    socket.on('error', error => {
+      clearTimeout(timer);
+      logger('Socket error:', error);
+      reject(error);
     });
-
-    it('starts a screencast recording with temp file when no filePath', async () => {
-      await withMcpContext(async (response, context) => {
-        const mockRecorder = createMockRecorder();
-        const selectedPage = context.getSelectedPptrPage();
-        const screencastStub = sinon
-          .stub(selectedPage, 'screencast')
-          .resolves(mockRecorder as never);
-
-        await startScreencast().handler(
-          {params: {}, page: context.getSelectedMcpPage()},
-          response,
-          context,
-        );
-
-        sinon.assert.calledOnce(screencastStub);
-        const callArgs = screencastStub.firstCall.args[0];
-        assert.ok(callArgs);
-        assert.ok(callArgs.path?.endsWith('.mp4'));
-        assert.ok(context.getScreenRecorder() !== null);
-      });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      logger('Socket closed:');
+      reject(new Error('Socket closed'));
     });
-
-    it('errors if a recording is already active', async () => {
-      await withMcpContext(async (response, context) => {
-        const mockRecorder = createMockRecorder();
-        context.setScreenRecorder({
-          recorder: mockRecorder as never,
-          filePath: '/tmp/existing.mp4',
-        });
-
-        const selectedPage = context.getSelectedPptrPage();
-        const screencastStub = sinon.stub(selectedPage, 'screencast');
-
-        await startScreencast().handler(
-          {params: {}, page: context.getSelectedMcpPage()},
-          response,
-          context,
-        );
-
-        sinon.assert.notCalled(screencastStub);
-        assert.ok(
-          response.responseLines
-            .join('\n')
-            .includes('a screencast recording is already in progress'),
-        );
-      });
-    });
-
-    it('provides a clear error when ffmpeg is not found', async () => {
-      await withMcpContext(async (response, context) => {
-        const selectedPage = context.getSelectedPptrPage();
-        const error = new Error('spawn ffmpeg ENOENT');
-        sinon.stub(selectedPage, 'screencast').rejects(error);
-
-        await assert.rejects(
-          startScreencast().handler(
-            {
-              params: {filePath: '/tmp/test.mp4'},
-              page: context.getSelectedMcpPage(),
-            },
-            response,
-            context,
-          ),
-          /ffmpeg is required for screencast recording/,
-        );
-
-        assert.strictEqual(context.getScreenRecorder(), null);
-      });
-    });
-
-    it('passes ffmpegPath from args to puppeteer', async () => {
-      await withMcpContext(async (response, context) => {
-        const mockRecorder = createMockRecorder();
-        const selectedPage = context.getSelectedPptrPage();
-        const screencastStub = sinon
-          .stub(selectedPage, 'screencast')
-          .resolves(mockRecorder as never);
-
-        const experimentalFfmpegPath = '/custom/path/to/ffmpeg';
-        await startScreencast({
-          experimentalFfmpegPath,
-        } as ParsedArguments).handler(
-          {params: {}, page: context.getSelectedMcpPage()},
-          response,
-          context,
-        );
-
-        sinon.assert.calledOnce(screencastStub);
-        const callArgs = screencastStub.firstCall.args[0];
-        assert.strictEqual(callArgs?.ffmpegPath, experimentalFfmpegPath);
-      });
-    });
+    logger('Sending message', command);
+    transport.send(JSON.stringify(command));
   });
+}
 
-  describe('screencast_stop', () => {
-    it('does nothing if no recording is active', async () => {
-      await withMcpContext(async (response, context) => {
-        assert.strictEqual(context.getScreenRecorder(), null);
-        await stopScreencast.handler(
-          {params: {}, page: context.getSelectedMcpPage()},
-          response,
-          context,
-        );
-        assert.strictEqual(response.responseLines.length, 0);
-      });
-    });
+export async function stopDaemon(sessionId: string) {
+  if (!isDaemonRunning(sessionId)) {
+    logger('Daemon is not running');
+    return;
+  }
 
-    it('stops an active recording and reports the file path', async () => {
-      await withMcpContext(async (response, context) => {
-        const mockRecorder = createMockRecorder();
-        const filePath = '/tmp/test-recording.mp4';
-        context.setScreenRecorder({
-          recorder: mockRecorder as never,
-          filePath,
-        });
+  const pidFilePath = getPidFilePath(sessionId);
 
-        await stopScreencast.handler(
-          {params: {}, page: context.getSelectedMcpPage()},
-          response,
-          context,
-        );
+  await sendCommand({method: 'stop'}, sessionId);
 
-        sinon.assert.calledOnce(mockRecorder.stop);
-        assert.strictEqual(context.getScreenRecorder(), null);
-        assert.ok(
-          response.responseLines
-            .join('\n')
-            .includes('stopped and saved to /tmp/test-recording.mp4'),
-        );
-      });
-    });
+  await waitForFile(pidFilePath, /*removed=*/ true);
+}
 
-    it('clears the recorder even if stop() throws', async () => {
-      await withMcpContext(async (response, context) => {
-        const mockRecorder = createMockRecorder();
-        mockRecorder.stop.rejects(new Error('ffmpeg process error'));
-        context.setScreenRecorder({
-          recorder: mockRecorder as never,
-          filePath: '/tmp/test.mp4',
-        });
-
-        await assert.rejects(
-          stopScreencast.handler(
-            {params: {}, page: context.getSelectedMcpPage()},
-            response,
-            context,
-          ),
-          /ffmpeg process error/,
-        );
-
-        assert.strictEqual(context.getScreenRecorder(), null);
-      });
-    });
-  });
-});
+export async function handleResponse(
+  response: CallToolResult,
+  format: 'json' | 'md',
+): Promise<string> {
+  if (response.isError) {
+    return JSON.stringify(response.content);
+  }
+  if (format === 'json') {
+    if (response.structuredContent) {
+      return JSON.stringify(response.structuredContent);
+    }
+    // Fall-through to text for backward compatibility.
+  }
+  const chunks = [];
+  for (const content of response.content) {
+    if (content.type === 'text') {
+      chunks.push(content.text);
+    } else if (content.type === 'image') {
+      const imageData = content.data;
+      const mimeType = content.mimeType;
+      let extension = '.png';
+      switch (mimeType) {
+        case 'image/jpg':
+        case 'image/jpeg':
+          extension = '.jpeg';
+          break;
+        case 'image/webp':
+          extension = '.webp';
+          break;
+      }
+      const data = Buffer.from(imageData, 'base64');
+      const name = crypto.randomUUID();
+      const filepath = await getTempFilePath(`${name}${extension}`);
+      fs.writeFileSync(filepath, data);
+      chunks.push(`Saved to ${filepath}.`);
+    } else {
+      throw new Error('Not supported response content type');
+    }
+  }
+  return format === 'md' ? chunks.join(' ') : JSON.stringify(chunks);
+}
